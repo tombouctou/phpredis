@@ -2192,62 +2192,42 @@ PHP_METHOD(Redis, hMset)
 }
 /* }}} */
 
-/* flag : get, set {ATOMIC, MULTI, PIPELINE} */
-
 PHP_METHOD(Redis, multi)
 {
-
     RedisSock *redis_sock;
-    char *cmd;
-    int response_len, cmd_len;
-    char * response;
+    char *cmd, *resp;
+    int cmd_len, resp_len;
     zval *object;
-    zend_long multi_value = MULTI;
+    zend_long unused;
 
     if (zend_parse_method_parameters(ZEND_NUM_ARGS() TSRMLS_CC, getThis(),
-                                     "O|l", &object, redis_ce, &multi_value)
-                                     == FAILURE)
-    {
+                                     "O|l", &object, redis_ce, &unused) == FAILURE ||
+        redis_sock_get(object, &redis_sock TSRMLS_CC, 0) < 0
+    ) {
         RETURN_FALSE;
     }
-
-    /* if the flag is activated, send the command, the reply will be "QUEUED"
-     * or -ERR */
-    if (redis_sock_get(object, &redis_sock TSRMLS_CC, 0) < 0) {
-        RETURN_FALSE;
-    }
-
-    if(multi_value == MULTI || multi_value == PIPELINE) {
-        redis_sock->mode = multi_value;
-    } else {
-        RETURN_FALSE;
-    }
-
-    redis_sock->current = NULL;
 
     IF_MULTI() {
-        cmd_len = redis_cmd_format_static(&cmd, "MULTI", "");
-
-	SOCKET_WRITE_COMMAND(redis_sock, cmd, cmd_len)
-        efree(cmd);
-
-        if ((response = redis_sock_read(redis_sock, &response_len TSRMLS_CC))
-                                        == NULL)
-        {
-            RETURN_FALSE;
-        }
-
-        if(strncmp(response, "+OK", 3) == 0) {
-            efree(response);
-            RETURN_ZVAL(getThis(), 1, 0);
-        }
-        efree(response);
-        RETURN_FALSE;
-    }
-    IF_PIPELINE() {
-        free_reply_callbacks(getThis(), redis_sock);
         RETURN_ZVAL(getThis(), 1, 0);
     }
+    cmd_len = redis_cmd_format_static(&cmd, "MULTI", "");
+    IF_PIPELINE() {
+        PIPELINE_ENQUEUE_COMMAND(cmd, cmd_len)
+        efree(cmd);
+    } else {
+        SOCKET_WRITE_COMMAND(redis_sock, cmd, cmd_len)
+        efree(cmd);
+        if ((resp = redis_sock_read(redis_sock, &resp_len TSRMLS_CC)) == NULL) {
+            RETURN_FALSE;
+        } else if (resp_len != 3 || strncmp(resp, "+OK", 3) != 0) {
+            efree(resp);
+            RETURN_FALSE;
+        }
+        efree(resp);
+    }
+    redis_sock->current = NULL;
+    REDIS_ENABLE_MODE(redis_sock, MULTI);
+    RETURN_ZVAL(getThis(), 1, 0);
 }
 
 /* discard */
@@ -2256,12 +2236,10 @@ PHP_METHOD(Redis, discard)
     RedisSock *redis_sock;
     zval *object;
 
-    if (zend_parse_method_parameters(ZEND_NUM_ARGS() TSRMLS_CC, getThis(), "O",
-                                     &object, redis_ce) == FAILURE) {
-        RETURN_FALSE;
-    }
-
-    if (redis_sock_get(object, &redis_sock TSRMLS_CC, 0) < 0) {
+    if (zend_parse_method_parameters(ZEND_NUM_ARGS() TSRMLS_CC, getThis(),
+                                     "O", &object, redis_ce) == FAILURE ||
+        redis_sock_get(object, &redis_sock TSRMLS_CC, 0) < 0
+    ) {
         RETURN_FALSE;
     }
 
@@ -2355,31 +2333,17 @@ PHP_METHOD(Redis, exec)
         RETURN_FALSE;
     }
 
-    IF_MULTI() {
-        cmd_len = redis_cmd_format_static(&cmd, "EXEC", "");
-
-	SOCKET_WRITE_COMMAND(redis_sock, cmd, cmd_len)
-        efree(cmd);
-
-        if(redis_sock_read_multibulk_multi_reply(
-           INTERNAL_FUNCTION_PARAM_PASSTHRU,
-           redis_sock) < 0)
-        {
-            zval_dtor(return_value);
-            free_reply_callbacks(object, redis_sock);
-            redis_sock->mode = ATOMIC;
-            redis_sock->watching = 0;
-            RETURN_FALSE;
-        }
-        free_reply_callbacks(object, redis_sock);
-        redis_sock->mode = ATOMIC;
-        redis_sock->watching = 0;
-    }
-
     IF_PIPELINE() {
         char *request = NULL;
         int total = 0, offset = 0;
         struct request_item *ri;
+
+        IF_MULTI() {
+            cmd_len = redis_cmd_format_static(&cmd, "EXEC", "");
+            PIPELINE_ENQUEUE_COMMAND(cmd, cmd_len);
+            efree(cmd);
+            REDIS_DISABLE_MODE(redis_sock, MULTI);
+        }
 
         /* compute the total request size */
         for(ri = redis_sock->pipeline_head; ri; ri = ri->next) {
@@ -2404,8 +2368,23 @@ PHP_METHOD(Redis, exec)
             /* Empty array when no command was run. */
             array_init(return_value);
         }
-        redis_sock->mode = ATOMIC;
+        REDIS_DISABLE_MODE(redis_sock, PIPELINE);
         free_reply_callbacks(object, redis_sock);
+    }
+
+    IF_MULTI() {
+        cmd_len = redis_cmd_format_static(&cmd, "EXEC", "");
+        SOCKET_WRITE_COMMAND(redis_sock, cmd, cmd_len);
+        efree(cmd);
+
+        if (redis_sock_read_multibulk_multi_reply(
+           INTERNAL_FUNCTION_PARAM_PASSTHRU, redis_sock) < 0
+        ) {
+            ZVAL_FALSE(return_value);
+        }
+        REDIS_DISABLE_MODE(redis_sock, MULTI);
+        free_reply_callbacks(object, redis_sock);
+        redis_sock->watching = 0;
     }
 }
 
@@ -3404,12 +3383,10 @@ PHP_METHOD(Redis, getMode) {
     RedisSock *redis_sock;
 
     /* Grab our object */
-    if (zend_parse_method_parameters(ZEND_NUM_ARGS() TSRMLS_CC, getThis(), "O", &object, redis_ce) == FAILURE) {
-        RETURN_FALSE;
-    }
-
-    /* Grab socket */
-    if (redis_sock_get(object, &redis_sock TSRMLS_CC, 0) < 0) {
+    if (zend_parse_method_parameters(ZEND_NUM_ARGS() TSRMLS_CC, getThis(),
+                                     "O", &object, redis_ce) == FAILURE ||
+        redis_sock_get(object, &redis_sock TSRMLS_CC, 0) < 0
+    ) {
         RETURN_FALSE;
     }
 
